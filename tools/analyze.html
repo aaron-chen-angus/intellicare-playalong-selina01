@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>intelliCARE · Drum-stem analyser</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{font:14px/1.45 system-ui,"Segoe UI",sans-serif;background:#0a0a14;color:#e8e8f4;margin:0;padding:20px}
+h1{font-size:20px;margin:0 0 6px}.box{border:1px dashed #556;border-radius:12px;padding:16px;margin:10px 0}
+button{background:#ff3b5c;border:0;color:#fff;padding:8px 16px;border-radius:8px;font-weight:700;cursor:pointer}
+pre{white-space:pre-wrap;background:#000;padding:10px;border-radius:8px;max-height:300px;overflow:auto;font-size:12px}
+img{max-width:100%;display:block;margin:8px 0;border-radius:6px}label{display:block;margin:6px 0}
+</style></head><body>
+<h1>Drum-stem analyser → beatmap.json</h1>
+<p>Choose the <b>isolated drum track</b> (WAV/MP3) of the song. Optionally choose the <b>performance video/audio</b> too: the analyser then cross-correlates the two and corrects any time offset so the chart lines up with the video. Everything runs locally in your browser.</p>
+<div class="box"><label>Drum track: <input type="file" id="fDrums" accept="audio/*,video/*"></label>
+<label>Drum samples KICK / SNARE / HI-HAT / TOM / CYMBAL (select all 5; used as NMF templates): <input type="file" id="fSamples" accept="audio/*" multiple></label>
+<label>Video or full mix (optional, for alignment): <input type="file" id="fVideo" accept="audio/*,video/*"></label>
+<button id="go">Analyse</button> <button id="dl" disabled>Download beatmap.json</button></div>
+<pre id="log"></pre><div id="imgs"></div><pre id="out"></pre>
+<script>
+'use strict';
+/* ---------- utilities ---------- */
+const log = s => { document.getElementById('log').textContent += s + '\n'; console.log(s); };
+const median = a => { const s = Float64Array.from(a).sort(); const n = s.length; return n ? (n % 2 ? s[n >> 1] : (s[n / 2 - 1] + s[n / 2]) / 2) : 0; };
+const pct = (a, p) => { const s = Float64Array.from(a).sort(); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+const r3 = x => Math.round(x * 1000) / 1000;
+async function decode(buf) { const ac = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, 44100, 44100); return await ac.decodeAudioData(buf); }
+function mono(ab) { const n = ab.length, m = new Float32Array(n), c = ab.numberOfChannels; for (let ch = 0; ch < c; ch++) { const d = ab.getChannelData(ch); for (let i = 0; i < n; i++) m[i] += d[i] / c; } return m; }
+function fft(re, im) { const n = re.length; for (let i = 1, j = 0; i < n; i++) { let b = n >> 1; for (; j & b; b >>= 1) j ^= b; j ^= b; if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; } }
+  for (let len = 2; len <= n; len <<= 1) { const a = -2 * Math.PI / len, wr = Math.cos(a), wi = Math.sin(a); for (let i = 0; i < n; i += len) { let cr = 1, ci = 0; for (let k = 0; k < len / 2; k++) { const ur = re[i + k], ui = im[i + k], vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci, vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+    re[i + k] = ur + vr; im[i + k] = ui + vi; re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi; const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t; } } } }
+/* ---------- STFT band energies ---------- */
+const BANDS = { sub: [30, 95], low: [95, 260], mid: [260, 1400], snr: [1400, 5000], hi: [6500, 16000], air: [4000, 16000] };
+function bandEnergies(x, sr) {
+  const N = 2048, hop = Math.round(sr * 0.01), nF = Math.floor((x.length - N) / hop) + 1, win = new Float32Array(N);
+  for (let i = 0; i < N; i++) win[i] = .5 - .5 * Math.cos(2 * Math.PI * i / N);
+  const E = {}; for (const k in BANDS) E[k] = new Float32Array(nF);
+  const cent = new Float32Array(nF), bin = f => Math.round(f * N / sr), re = new Float64Array(N), im = new Float64Array(N);
+  for (let f = 0; f < nF; f++) {
+    const o = f * hop; for (let i = 0; i < N; i++) { re[i] = x[o + i] * win[i]; im[i] = 0; } fft(re, im);
+    for (const k in BANDS) { let s = 0; for (let b = bin(BANDS[k][0]); b <= bin(BANDS[k][1]); b++) s += re[b] * re[b] + im[b] * im[b]; E[k][f] = s; }
+    let sw = 0, s = 0; for (let b = bin(60); b <= bin(400); b++) { const m = re[b] * re[b] + im[b] * im[b]; sw += m * b; s += m; } cent[f] = s ? sw / s * sr / N : 0;
+  }
+  return { E, cent, hop, N, nF, frameT: f => (f * hop + N / 2) / sr };
+}
+/* superflux-like onset function on log band energy */
+function flux(e) { const n = e.length, L = new Float32Array(n), F = new Float32Array(n); let mx = 0; for (let i = 0; i < n; i++) mx = Math.max(mx, e[i]);
+  for (let i = 0; i < n; i++) L[i] = Math.log10(1 + 1e4 * e[i] / (mx || 1));
+  for (let i = 2; i < n; i++) F[i] = Math.max(0, L[i] - L[i - 1]) + .5 * Math.max(0, L[i] - L[i - 2]); return { L, F }; }
+function peaks(F, k, wait, win) {
+  const n = F.length, out = [], nz = []; for (let i = 0; i < n; i++) if (F[i] > 0) nz.push(F[i]);
+  const floor = pct(nz, .5) + k * (pct(nz, .97) - pct(nz, .5)); let last = -1e9;
+  for (let i = 3; i < n - 3; i++) { if (F[i] < floor) continue; let ok = true; for (let j = -3; j <= 3; j++) if (F[i + j] > F[i]) { ok = false; break; } if (!ok) continue;
+    let s = 0, c = 0; for (let j = Math.max(0, i - win); j < Math.min(n, i + win); j++) { s += F[j]; c++; } if (F[i] < 1.4 * s / c) continue;
+    if (i - last < wait) { if (out.length && F[i] > out[out.length - 1].s) { out[out.length - 1] = { f: i, s: F[i] }; last = i; } continue; } out.push({ f: i, s: F[i] }); last = i; }
+  return { list: out, floor };
+}
+/* time-domain refinement: max slope of a 1 ms envelope within [-35, +15] ms */
+function envelope1ms(x, sr) { const h = Math.round(sr / 1000), n = Math.floor(x.length / h), e = new Float32Array(n); for (let i = 0; i < n; i++) { let m = 0; for (let j = 0; j < h; j++) { const v = Math.abs(x[i * h + j]); if (v > m) m = v; } e[i] = m; } return e; }
+function refine(env, tSec) { const c = Math.round(tSec * 1000); let best = c, bs = -1; for (let i = Math.max(2, c - 35); i < Math.min(env.length - 1, c + 15); i++) { const s = env[i] - env[i - 2]; if (s > bs) { bs = s; best = i - 1; } } return best / 1000; }
+function lowpass(x, sr, fc) { const y = new Float32Array(x.length), a = Math.exp(-2 * Math.PI * fc / sr); let p = 0, q = 0; for (let i = 0; i < x.length; i++) { p = (1 - a) * x[i] + a * p; q = (1 - a) * p + a * q; y[i] = q; } return y; }
+function highpass(x, sr, fc) { const l = lowpass(x, sr, fc), y = new Float32Array(x.length); for (let i = 0; i < x.length; i++) y[i] = x[i] - l[i]; return y; }
+
+/* ---------- transcription ---------- */
+function transcribe(x, sr, P) {
+  const S = bandEnergies(x, sr), F = {}, L = {}; for (const k in BANDS) { const r = flux(S.E[k]); F[k] = r.F; L[k] = r.L; }
+  const pk = { sub: peaks(F.sub, P.kSub, 9, 60), low: peaks(F.low, P.kLow, 9, 60), snr: peaks(F.snr, P.kSnr, 8, 60), hi: peaks(F.hi, P.kHi, 6, 60) };
+  const at = (k, f, d) => S.E[k][Math.min(S.nF - 1, f + d)];
+  const near = (list, f, w) => list.find(p => Math.abs(p.f - f) <= w);
+  const notes = [], used = { low: new Set() };
+  const vel = (s, list) => Math.min(1, .45 + .55 * s / (pct(list.map(p => p.s), .95) || 1));
+  // KICK: sub-band onset whose sub increase dominates the snare band increase
+  for (const p of pk.sub.list) { const sn = near(pk.snr.list, p.f, 2), ratio = F.sub[p.f] / (F.snr[p.f] + 1e-6);
+    if (sn && ratio < P.kickVsSnare) continue; const lowP = near(pk.low.list, p.f, 2); if (lowP) used.low.add(lowP.f); notes.push({ f: p.f, l: 'kick', v: vel(p.s, pk.sub.list) }); }
+  // SNARE: crack band onset with body/noise, not mainly a hat
+  const snareF = [];
+  for (const p of pk.snr.list) { const hiInc = F.hi[p.f] + F.hi[p.f + 1], snInc = F.snr[p.f] + F.snr[p.f + 1];
+    const lowInc = Math.max(F.low[p.f], F.low[p.f + 1], F.mid[p.f], F.mid[p.f + 1]);
+    if (snInc < P.snareVsHat * hiInc && lowInc < P.snareMinBody) continue;
+    notes.push({ f: p.f, l: 'snare', v: vel(p.s, pk.snr.list) }); snareF.push(p.f); const lowP = near(pk.low.list, p.f, 2); if (lowP) used.low.add(lowP.f); }
+  // HI band: hat vs cymbal by decay ratio at +300 ms
+  for (const p of pk.hi.list) { if (snareF.some(f => Math.abs(f - p.f) <= 1) && F.hi[p.f] < P.hatOverSnare * F.snr[p.f]) continue;
+    const peakE = Math.max(at('air', p.f, 0), at('air', p.f, 1), at('air', p.f, 2)), dec = at('air', p.f, 30) / (peakE + 1e-12);
+    notes.push({ f: p.f, l: dec > P.cymDecay ? 'cymbal' : 'hihat', v: vel(p.s, pk.hi.list), dec }); }
+  // TOM: low-band onsets not explained by kick/snare, tonal (sustained body), no crack
+  for (const p of pk.low.list) { if (used.low.has(p.f)) continue; if (near(notes.filter(n => n.l === 'kick' || n.l === 'snare'), p.f, 3)) continue;
+    const sus = at('low', p.f, 15) / (Math.max(at('low', p.f, 0), at('low', p.f, 2)) + 1e-12);
+    if (sus < P.tomSustain) continue; notes.push({ f: p.f, l: 'tom', v: vel(p.s, pk.low.list) }); }
+  // time refinement (sample domain)
+  const envAll = envelope1ms(highpass(x, sr, 30), sr), envLow = envelope1ms(lowpass(x, sr, 120), sr);
+  const out = notes.map(n => { const tc = S.frameT(n.f); const t = refine(n.l === 'kick' || n.l === 'tom' ? envLow : envAll, tc); return { t: r3(t), l: n.l, v: Math.round(n.v * 100) / 100, bud: false }; });
+  out.sort((a, b) => a.t - b.t);
+  const dd = [], last = {}; for (const n of out) { if (last[n.l] !== undefined && n.t - last[n.l] < .03) continue; last[n.l] = n.t; dd.push(n); }
+  return { notes: dd, S, F, L };
+}
+/* ---------- NMF transcription with sample templates (fixed-W, then semi-adaptive) ---------- */
+const NB = 96, LANES = ['kick', 'snare', 'hihat', 'tom', 'cymbal'];
+function filterbank(N, sr) { const fb = [], lo = Math.log(30), hi = Math.log(16000), c = []; for (let i = 0; i < NB + 2; i++) c.push(Math.exp(lo + (hi - lo) * i / (NB + 1)));
+  for (let b = 0; b < NB; b++) { const a = c[b], m = c[b + 1], z = c[b + 2], row = []; for (let k = 0; k <= N / 2; k++) { const f = k * sr / N; const w = f <= a || f >= z ? 0 : f <= m ? (f - a) / (m - a) : (z - f) / (z - m); if (w > 0) row.push([k, w]); }
+    if (!row.length) { const k = Math.round(m * N / sr); row.push([k, 1]); } fb.push(row); } return fb; }
+function logSpec(x, sr) {
+  const N = 2048, hop = Math.round(sr * .01), nF = Math.max(1, Math.floor((x.length - N) / hop) + 1), win = new Float32Array(N), fb = filterbank(N, sr);
+  for (let i = 0; i < N; i++) win[i] = .5 - .5 * Math.cos(2 * Math.PI * i / N);
+  const V = new Float32Array(NB * nF), re = new Float64Array(N), im = new Float64Array(N), mag = new Float64Array(N / 2 + 1);
+  for (let f = 0; f < nF; f++) { const o = f * hop; for (let i = 0; i < N; i++) { re[i] = (x[o + i] || 0) * win[i]; im[i] = 0; } fft(re, im);
+    for (let k = 0; k <= N / 2; k++) mag[k] = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+    for (let b = 0; b < NB; b++) { let s = 0; for (const [k, w] of fb[b]) s += mag[k] * w; V[b * nF + f] = s; } }
+  return { V, nF, hop, N, frameT: f => (f * hop + N / 2) / sr };
+}
+function template(sample, sr, lane) { const S = logSpec(sample, sr), w = new Float64Array(NB); let e = new Float64Array(S.nF), mx = 0;
+  for (let f = 0; f < S.nF; f++) { let s = 0; for (let b = 0; b < NB; b++) s += S.V[b * S.nF + f]; e[f] = s; mx = Math.max(mx, s); }
+  const fmax = e.indexOf(mx), span = lane === 'cymbal' ? 40 : lane === 'kick' || lane === 'tom' ? 15 : 8;
+  for (let f = fmax; f < Math.min(S.nF, fmax + span); f++) for (let b = 0; b < NB; b++) w[b] += S.V[b * S.nF + f];
+  const s = w.reduce((a, b) => a + b, 0) || 1; for (let b = 0; b < NB; b++) w[b] = w[b] / s + 1e-9; return w; }
+function nmf(V, nF, W0, iters) {
+  const K = W0.length, W = W0.map(w => Float64Array.from(w)), H = []; for (let k = 0; k < K; k++) H.push(new Float64Array(nF).fill(.1));
+  const R = new Float64Array(NB * nF);
+  for (let it = 0; it < iters; it++) {
+    for (let b = 0; b < NB; b++) for (let f = 0; f < nF; f++) { let s = 1e-12; for (let k = 0; k < K; k++) s += W[k][b] * H[k][f]; R[b * nF + f] = V[b * nF + f] / s; }
+    for (let k = 0; k < K; k++) { let ws = 0; for (let b = 0; b < NB; b++) ws += W[k][b]; const h = H[k], w = W[k];
+      for (let f = 0; f < nF; f++) { let s = 0; for (let b = 0; b < NB; b++) s += w[b] * R[b * nF + f]; h[f] *= s / ws; } }
+    if (it >= iters * .6) { // semi-adaptive templates: update W, then pull 50 % back toward the sample template
+      for (let b = 0; b < NB; b++) for (let f = 0; f < nF; f++) { let s = 1e-12; for (let k = 0; k < K; k++) s += W[k][b] * H[k][f]; R[b * nF + f] = V[b * nF + f] / s; }
+      for (let k = 0; k < K; k++) { let hs = 0; const h = H[k]; for (let f = 0; f < nF; f++) hs += h[f]; for (let b = 0; b < NB; b++) { let s = 0; for (let f = 0; f < nF; f++) s += h[f] * R[b * nF + f]; W[k][b] *= s / (hs || 1); }
+        let sum = 0; for (let b = 0; b < NB; b++) sum += W[k][b]; for (let b = 0; b < NB; b++) W[k][b] = .5 * W[k][b] / sum + .5 * W0[k][b]; } }
+  }
+  return H;
+}
+function movingMax(a, r) { const n = a.length, o = new Float64Array(n); for (let i = 0; i < n; i++) { let m = 0; for (let j = Math.max(0, i - r); j <= Math.min(n - 1, i + r); j++) if (a[j] > m) m = a[j]; o[i] = m; } return o; }
+function transcribeNMF(x, sr, samples, P) {
+  const S = logSpec(x, sr); log('spectrogram ' + NB + ' × ' + S.nF);
+  const W0 = LANES.map(l => template(samples[l], sr, l)), H = nmf(S.V, S.nF, W0, P.iters);
+  const D = H.map(h => { const d = new Float64Array(h.length); for (let i = 2; i < h.length; i++) d[i] = Math.max(0, h[i] - Math.max(h[i - 1], h[i - 2] * .5 + h[i - 1] * .5)); return d; });
+  const cand = [];
+  LANES.forEach((l, k) => { const h = H[k], d = D[k], mm = movingMax(h, 100), floor = P.floor[l] * pct(h, .995), wait = l === 'hihat' ? 6 : 8;
+    let last = -1e9; for (let i = 3; i < d.length - 3; i++) { if (d[i] <= 0) continue; let ok = true; for (let j = -3; j <= 3; j++) if (d[i + j] > d[i]) { ok = false; break; } if (!ok) continue;
+      const peakH = Math.max(h[i], h[i + 1], h[i + 2]); if (d[i] < floor || peakH < P.rel[l] * mm[i]) continue;
+      if (i - last < wait) continue; last = i; cand.push({ f: i, k, l, s: d[i], ph: peakH }); } });
+  // crosstalk suppression: at the same frame (±2), a weak activation on a "neighbour" lane is a leak
+  const pairs = { tom: ['kick', 'snare'], kick: ['tom'], snare: ['tom', 'hihat'], hihat: ['cymbal', 'snare'], cymbal: ['hihat'] };
+  const keep = cand.filter(c => !cand.some(o => o !== c && Math.abs(o.f - c.f) <= 2 && pairs[c.l].includes(o.l) && c.s / (pct(D[c.k], .995) || 1) < P.leak * o.s / (pct(D[o.k], .995) || 1)));
+  const envAll = envelope1ms(highpass(x, sr, 30), sr), envLow = envelope1ms(lowpass(x, sr, 150), sr);
+  const notes = keep.map(c => { const v = Math.min(1, .45 + .55 * c.s / (pct(D[c.k], .98) || 1)); const t = refine(c.l === 'kick' || c.l === 'tom' ? envLow : envAll, S.frameT(c.f)); return { t: r3(t), l: c.l, v: Math.round(v * 100) / 100, bud: false }; });
+  notes.sort((a, b) => a.t - b.t); const dd = [], lt = {}; for (const n of notes) { if (lt[n.l] !== undefined && n.t - lt[n.l] < .04) continue; lt[n.l] = n.t; dd.push(n); }
+  return { notes: dd, H, S };
+}
+function renderNMF(res, t0, t1, beats, down, title) {
+  const W = 1400, H = 470, c = document.createElement('canvas'); c.width = W; c.height = H; const g = c.getContext('2d'); g.fillStyle = '#0b0b16'; g.fillRect(0, 0, W, H);
+  const col = { kick: '#FF7A1A', snare: '#FF3B5C', hihat: '#FFD23F', tom: '#3D8BFF', cymbal: '#2EE6A6' }, X = t => (t - t0) / (t1 - t0) * W, f0 = Math.floor(t0 * 100), f1 = Math.ceil(t1 * 100);
+  for (const b of beats) if (b >= t0 && b < t1) { g.strokeStyle = down.includes(b) ? '#fff8' : '#fff2'; g.beginPath(); g.moveTo(X(b), 0); g.lineTo(X(b), H); g.stroke(); }
+  LANES.forEach((l, k) => { const y0 = 20 + k * 58, h = res.H[k]; let mx = 1e-9; for (let f = f0; f < f1; f++) mx = Math.max(mx, h[f] || 0); g.strokeStyle = col[l]; g.globalAlpha = .7; g.beginPath();
+    for (let f = f0; f < f1; f++) { const x = X(res.S.frameT(f)), y = y0 + 50 - (h[f] || 0) / mx * 46; f === f0 ? g.moveTo(x, y) : g.lineTo(x, y); } g.stroke(); g.globalAlpha = 1; g.fillStyle = col[l]; g.font = '11px monospace'; g.fillText(l, 2, y0 + 12);
+    for (const n of res.notes) if (n.l === l && n.t >= t0 && n.t < t1) { g.beginPath(); g.arc(X(n.t), y0 + 52, 3 + 4 * n.v, 0, 7); g.fill(); } });
+  g.fillStyle = '#fff'; g.font = '13px sans-serif'; g.fillText(title + '  ' + t0.toFixed(1) + '–' + t1.toFixed(1) + ' s', 60, 14); return c.toDataURL('image/png');
+}
+/* ---------- tempo + DP beat tracker (Ellis 2007) ---------- */
+function beatTrack(onsetEnv, fps, bpmMin, bpmMax) {
+  const n = onsetEnv.length, o = Float64Array.from(onsetEnv); const m = o.reduce((a, b) => a + b, 0) / n, sd = Math.sqrt(o.reduce((a, b) => a + (b - m) ** 2, 0) / n) || 1; for (let i = 0; i < n; i++) o[i] = (o[i] - m) / sd;
+  let best = 0, bestLag = 50; const sc = [];
+  for (let lag = Math.round(60 * fps / bpmMax); lag <= Math.round(60 * fps / bpmMin); lag++) { let s = 0; for (let i = lag; i < n; i++) s += o[i] * o[i - lag];
+    const bpm = 60 * fps / lag, w = Math.exp(-.5 * (Math.log2(bpm / 120) / .9) ** 2); sc.push([lag, s * w]); if (s * w > best) { best = s * w; bestLag = lag; } }
+  // parabolic refine
+  const i0 = sc.findIndex(v => v[0] === bestLag); let P = bestLag; if (i0 > 0 && i0 < sc.length - 1) { const a = sc[i0 - 1][1], b = sc[i0][1], c = sc[i0 + 1][1]; P = bestLag + .5 * (a - c) / (a - 2 * b + c); }
+  const alpha = 400, C = new Float64Array(n), back = new Int32Array(n).fill(-1);
+  for (let t = 0; t < n; t++) { let bv = -1e9, bi = -1; for (let tau = Math.max(0, Math.round(t - 2 * P)); tau <= t - Math.round(P / 2); tau++) { const v = C[tau] - alpha * Math.log((t - tau) / P) ** 2; if (v > bv) { bv = v; bi = tau; } }
+    C[t] = o[t] + (bi >= 0 ? Math.max(0, bv) : 0); back[t] = bv > 0 ? bi : -1; }
+  let t = 0, mx = -1e9; for (let i = n - Math.round(P); i < n; i++) if (C[i] > mx) { mx = C[i]; t = i; }
+  const beats = []; while (t >= 0) { beats.push(t); t = back[t]; } beats.reverse();
+  return { beats: beats.map(f => f / fps), bpm: 60 * fps / P };
+}
+/* ---------- cross-correlation alignment ---------- */
+function onsetEnv100(x, sr) { const S = bandEnergies(x, sr), a = flux(S.E.sub).F, b = flux(S.E.snr).F, e = new Float32Array(S.nF); for (let i = 0; i < S.nF; i++) e[i] = a[i] + b[i]; return e; }
+function xcorr(a, b, maxLag) { let best = -1e18, bl = 0; const res = []; const m = Math.min(a.length, b.length);
+  for (let lag = -maxLag; lag <= maxLag; lag++) { let s = 0; for (let i = Math.max(0, -lag); i < m && i + lag < b.length; i++) s += a[i] * b[i + lag]; res.push(s); if (s > best) { best = s; bl = lag; } }
+  const sorted = res.slice().sort((x, y) => y - x); return { lag: bl, sharp: best / (sorted[Math.min(50, sorted.length - 1)] || 1) }; }
+/* ---------- bars, sections ---------- */
+function downbeatPhase(beats, notes) {
+  const nearest = (t) => { let lo = 0, hi = beats.length - 1; while (lo < hi) { const md = (lo + hi) >> 1; if (beats[md] < t) lo = md + 1; else hi = md; } if (lo > 0 && Math.abs(beats[lo - 1] - t) < Math.abs(beats[lo] - t)) lo--; return lo; };
+  const sc = [0, 0, 0, 0]; for (const n of notes) { const i = nearest(n.t); if (Math.abs(beats[i] - n.t) > .07) continue;
+    for (let p = 0; p < 4; p++) { const pos = ((i - p) % 4 + 4) % 4; if (n.l === 'kick' && pos === 0) sc[p] += 2; if (n.l === 'kick' && pos === 2) sc[p] += .5; if (n.l === 'snare' && (pos === 1 || pos === 3)) sc[p] += 1; if (n.l === 'snare' && pos === 0) sc[p] -= 1; if (n.l === 'cymbal' && pos === 0) sc[p] += 1.5; } }
+  return sc.indexOf(Math.max(...sc));
+}
+function sections(down, notes, dur) {
+  const bars = []; for (let i = 0; i < down.length; i++) { const a = down[i], b = down[i + 1] || dur, c = { kick: 0, snare: 0, hihat: 0, tom: 0, cymbal: 0, n: 0 }; for (const n of notes) if (n.t >= a && n.t < b) { c[n.l]++; c.n++; } bars.push(c); }
+  const feat = c => [c.kick, c.snare, c.hihat, c.tom * .5, c.cymbal * 2, c.n * .3];
+  const dist = (i, w) => { const A = [0, 0, 0, 0, 0, 0], B = [0, 0, 0, 0, 0, 0]; for (let k = 0; k < w; k++) { const fa = feat(bars[i - 1 - k] || bars[0]), fb = feat(bars[i + k] || bars[bars.length - 1]); for (let j = 0; j < 6; j++) { A[j] += fa[j] / w; B[j] += fb[j] / w; } } return Math.sqrt(A.reduce((s, v, j) => s + (v - B[j]) ** 2, 0)); };
+  const nov = bars.map((_, i) => i < 2 ? 0 : dist(i, 4)), thr = pct(nov.filter(v => v > 0), .8); const cuts = [0];
+  for (let i = 4; i < bars.length - 3; i++) { if (nov[i] >= thr && nov[i] >= nov[i - 1] && nov[i] >= nov[i + 1] && i - cuts[cuts.length - 1] >= 4) cuts.push(i); }
+  const dens = cuts.map((c, k) => { const e = cuts[k + 1] || bars.length; let s = 0; for (let i = c; i < e; i++) s += bars[i].n + 2 * bars[i].cymbal; return s / Math.max(1, e - c); });
+  const hiD = pct(dens, .6); let v = 0, ch = 0;
+  return cuts.map((c, k) => { let name; if (k === 0 && dens[0] < hiD) name = 'Intro'; else if (k === cuts.length - 1 && cuts.length > 2 && dens[k] < hiD) name = 'Outro'; else if (dens[k] >= hiD) name = 'Chorus ' + (++ch); else name = 'Verse ' + (++v); return { t: r3(down[c]), name }; });
+}
+/* ---------- visual check image ---------- */
+function render(res, t0, t1, beats, down, title) {
+  const W = 1400, H = 420, c = document.createElement('canvas'); c.width = W; c.height = H; const g = c.getContext('2d'); g.fillStyle = '#0b0b16'; g.fillRect(0, 0, W, H);
+  const S = res.S, f0 = Math.floor(t0 * 100), f1 = Math.ceil(t1 * 100), X = t => (t - t0) / (t1 - t0) * W, rows = ['sub', 'low', 'snr', 'hi'], col = { kick: '#FF7A1A', snare: '#FF3B5C', hihat: '#FFD23F', tom: '#3D8BFF', cymbal: '#2EE6A6' };
+  rows.forEach((k, r) => { const y0 = 20 + r * 60; g.fillStyle = '#889'; g.font = '11px monospace'; g.fillText(k, 2, y0 + 12); let mx = 0; for (let f = f0; f < f1; f++) mx = Math.max(mx, res.L[k][f] || 0); g.strokeStyle = '#7af'; g.beginPath();
+    for (let f = f0; f < f1; f++) { const x = X(S.frameT(f)), y = y0 + 55 - (res.L[k][f] || 0) / (mx || 1) * 50; f === f0 ? g.moveTo(x, y) : g.lineTo(x, y); } g.stroke(); });
+  const lanes = ['kick', 'snare', 'hihat', 'tom', 'cymbal']; lanes.forEach((l, r) => { const y = 270 + r * 28; g.fillStyle = col[l]; g.fillText(l, 2, y + 4); });
+  for (const b of beats) if (b >= t0 && b < t1) { g.strokeStyle = down.includes(b) ? '#fff8' : '#fff2'; g.beginPath(); g.moveTo(X(b), 0); g.lineTo(X(b), H); g.stroke(); }
+  for (const n of res.notes) if (n.t >= t0 && n.t < t1) { const y = 270 + lanes.indexOf(n.l) * 28; g.fillStyle = col[n.l]; g.beginPath(); g.arc(X(n.t), y, 4 + 5 * n.v, 0, 7); g.fill(); }
+  g.fillStyle = '#fff'; g.font = '13px sans-serif'; g.fillText(title + '  ' + t0.toFixed(1) + '–' + t1.toFixed(1) + ' s', 60, 14); return c.toDataURL('image/png');
+}
+/* ---------- main ---------- */
+const PARAMS = { iters: 60, leak: .35, floor: { kick: .08, snare: .08, hihat: .06, tom: .12, cymbal: .1 }, rel: { kick: .18, snare: .18, hihat: .14, tom: .3, cymbal: .3 }, kSub: .12, kLow: .2, kSnr: .1, kHi: .08, kickVsSnare: 1.2, snareVsHat: .55, snareMinBody: .25, hatOverSnare: 1.6, cymDecay: .42, tomSustain: .45 };
+async function run(drumBuf, videoBuf, opts) {
+  const P = Object.assign({}, PARAMS, opts || {}); delete P.samples; delete P.spots; const t0 = performance.now();
+  const ab = await decode(drumBuf), sr = ab.sampleRate, x = mono(ab), dur = ab.duration; log('drums: ' + dur.toFixed(2) + ' s @ ' + sr + ' Hz');
+  let res, env;
+  if (opts && opts.samples) {
+    const smp = {}; for (const l of LANES) { const b = await decode(opts.samples[l]); smp[l] = mono(b); if (b.sampleRate !== sr) log('warning: sample rate of ' + l + ' differs'); }
+    res = transcribeNMF(x, sr, smp, P);
+    env = new Float32Array(res.S.nF); res.H.forEach((h, k) => { const s = pct(h, .99) || 1, w = [1.2, 1, .4, .6, .6][k]; for (let i = 1; i < env.length; i++) env[i] += w * Math.max(0, h[i] - h[i - 1]) / s; });
+  } else {
+    res = transcribe(x, sr, P); env = new Float32Array(res.S.nF); for (let i = 0; i < env.length; i++) env[i] = res.F.sub[i] + res.F.snr[i] + .5 * res.F.hi[i];
+  }
+  log('notes: ' + res.notes.length + '  ' + JSON.stringify(res.notes.reduce((m, n) => (m[n.l] = (m[n.l] || 0) + 1, m), {})));
+  const bt = beatTrack(env, 100, 60, 200); let beats = bt.beats.map(b => r3(b + 0));
+  // refine beat times: shift each beat to nearest kick/snare within 40 ms
+  const ks = res.notes.filter(n => n.l === 'kick' || n.l === 'snare').map(n => n.t);
+  beats = beats.map(b => { let best = b, bd = .04; for (const t of ks) { const d = Math.abs(t - b); if (d < bd) { bd = d; best = t; } } return r3(best); });
+  log('tempo ≈ ' + bt.bpm.toFixed(2) + ' BPM, beats ' + beats.length);
+  const ph = downbeatPhase(beats, res.notes), down = beats.filter((_, i) => i % 4 === ph);
+  log('downbeat phase ' + ph + ', bars ' + down.length);
+  let offset = 0, videoDur = null, sharp = null;
+  if (videoBuf) { try { const vb = await decode(videoBuf); videoDur = vb.duration; const vx = mono(vb); log('video audio: ' + videoDur.toFixed(2) + ' s @ ' + vb.sampleRate);
+      const a = onsetEnv100(x, sr), b = onsetEnv100(vx, vb.sampleRate), xc = xcorr(a, b, 2000); offset = xc.lag / 100; sharp = xc.sharp;
+      // sub-frame refine with 1 ms envelopes around the coarse lag
+      log('alignment: drums occur ' + offset.toFixed(2) + ' s later in the video (peak sharpness ' + xc.sharp.toFixed(2) + ')'); } catch (e) { log('video decode failed: ' + e.message); } }
+  const sh = n => r3(n + offset);
+  const notes = res.notes.map(n => ({ ...n, t: sh(n.t) })), B = beats.map(sh), D = down.map(sh), secs = sections(D, notes, (videoDur || dur));
+  log('sections: ' + secs.map(s => s.name + '@' + s.t).join(', '));
+  // song metadata comes from tools/song.json (one place per song)
+  let SONG = { title_zh: '', title_en: '', artist: '', video: '' }; try { SONG = Object.assign(SONG, await (await fetch('song.json')).json()); } catch (e) { log('note: tools/song.json not readable — song metadata left blank'); }
+  const beatmap = { version: 1, song: { title_zh: SONG.title_zh, title_en: SONG.title_en, artist: SONG.artist,
+      video: SONG.video, duration: r3(videoDur || dur + offset), previewStart: 30 },
+    offsetMs: 0, bpm: Math.round(bt.bpm * 100) / 100, beats: B, downbeats: D, sections: secs, lanes: ['kick', 'snare', 'hihat', 'tom', 'cymbal'],
+    charts: { full: notes, fire: [], groove: [], gentle: [] },
+    meta: { generator: 'tools/analyze.html (band-split spectral flux on isolated drum stem + DP beat tracker)', created: new Date().toISOString().slice(0, 10), alignOffsetS: offset, alignSharpness: sharp, params: P } };
+  window.BEATMAP = beatmap; document.getElementById('out').textContent = JSON.stringify(beatmap);
+  const imgs = document.getElementById('imgs'); imgs.innerHTML = '';
+  const spots = (opts && opts.spots) || [10, dur * .3, dur * .55, dur * .8]; spots.forEach((s, i) => { const im = new Image(); im.id = 'img' + i; im.src = (res.H ? renderNMF : render)(res, s, s + 6, beats, down, 'drum stem (unshifted)'); imgs.appendChild(im); });
+  document.getElementById('dl').disabled = false; log('done in ' + ((performance.now() - t0) / 1000).toFixed(1) + ' s'); document.title = 'DONE';
+  return beatmap;
+}
+document.getElementById('go').onclick = async () => { const d = document.getElementById('fDrums').files[0], v = document.getElementById('fVideo').files[0]; if (!d) return alert('Choose the drum track first');
+  const samples = await loadSamples(document.getElementById('fSamples').files).catch(() => null);
+  await run(await d.arrayBuffer(), v ? await v.arrayBuffer() : null, samples ? { samples } : {}); };
+const SAMPLE_FILES = { kick: 'KICK.mp3', snare: 'SNARE.mp3', hihat: 'HI-HAT.mp3', tom: 'TOM.mp3', cymbal: 'CYMBAL.mp3' };
+async function loadSamples(fileList, base) {
+  const out = {};
+  if (fileList && fileList.length) { for (const f of fileList) { const n = f.name.toUpperCase(); for (const l of LANES) if (n.indexOf(SAMPLE_FILES[l].split('.')[0]) === 0) out[l] = await f.arrayBuffer(); } }
+  else for (const l of LANES) out[l] = await (await fetch((base || '../sounds/') + SAMPLE_FILES[l])).arrayBuffer();
+  for (const l of LANES) if (!out[l]) throw new Error('missing sample ' + l); return out;
+}
+document.getElementById('dl').onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(window.BEATMAP)], { type: 'application/json' })); a.download = 'beatmap.json'; a.click(); };
+// headless/automation: ?drums=URL&video=URL&params=JSON
+(async () => { const q = new URLSearchParams(location.search); if (!q.get('drums')) return;
+  try { const get = async u => (await fetch(u)).arrayBuffer(); const opts = q.get('params') ? JSON.parse(q.get('params')) : {};
+    if (!q.has('bands')) opts.samples = await loadSamples(null, q.get('samples') || '../sounds/');
+    await run(await get(q.get('drums')), q.get('video') ? await get(q.get('video')) : null, opts); } catch (e) { log('ERROR ' + e.stack); document.title = 'ERROR'; } })();
+</script></body></html>

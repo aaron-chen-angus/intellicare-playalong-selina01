@@ -1,0 +1,46 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>gs syntax check</title></head><body><pre id="log"></pre>
+<script>
+// Parses tools/apps_script.gs (and the embedded DASH_HTML script) with the browser's JS engine, then runs
+// exportCsv_/dashAgg_ against a mocked SpreadsheetApp with sample rows to catch runtime errors before deploying.
+(async () => { const L = []; const log = s => { L.push(s); document.getElementById('log').textContent = L.join('\n'); };
+  try {
+    const src = await (await fetch('apps_script.gs')).text();
+    new Function(src); log('apps_script.gs: syntax OK (' + src.length + ' chars)');
+    const m = src.match(/const DASH_HTML = `([\s\S]*?)`;/); const inner = m[1].match(/<script>([\s\S]*?)<\/script>/g).pop().replace(/<\/?script>/g, '');
+    new Function(inner); log('DASH_HTML script: syntax OK');
+    // ---------- mock run ----------
+    const now = new Date(), hdrS = null;
+    const sheets = {}; const mkSheet = (name, rows) => { const data = rows; return { name, data,
+      getLastRow: () => data.length, getLastColumn: () => data[0] ? data[0].length : 0, getMaxRows: () => 1000, getMaxColumns: () => 80,
+      getRange: (r, c, nr, nc) => ({ getValues: () => data.slice(r - 1, r - 1 + nr).map(x => x.slice(c - 1, c - 1 + nc)), setValues: v => { v.forEach((row, i) => { data[r - 1 + i] = data[r - 1 + i] || []; row.forEach((x, j) => data[r - 1 + i][c - 1 + j] = x); }); } }),
+      appendRow: row => data.push(row), getDataRange: () => ({ getValues: () => data.map(r => r.slice()) }) }; };
+    const env = {}; const g = new Function('env', src + '\n;return {TABS, exportCsv_, dashAgg_, appendSession_, LANES};');
+    // globals needed by the script
+    const store = {};
+    window.SpreadsheetApp = { openById: () => ({ getSheetByName: n => sheets[n], getSpreadsheetTimeZone: () => 'Asia/Singapore' }) };
+    window.Utilities = { formatDate: (d, tz, f) => { d = new Date(d); const p = x => ('0' + x).slice(-2); if (f === 'yyyy-MM-dd') return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()); if (f === 'u') return String((d.getDay() + 6) % 7 + 1); if (f === 'H') return String(d.getHours()); return d.toISOString(); },
+      computeDigest: (a, s) => Array.from(new TextEncoder().encode(s)).slice(0, 32), DigestAlgorithm: { SHA_256: 1 }, Charset: { UTF_8: 1 }, getUuid: () => 'salt' };
+    window.PropertiesService = { getScriptProperties: () => ({ getProperty: k => store[k] || null, setProperty: (k, v) => store[k] = v }) };
+    window.CacheService = { getScriptCache: () => ({ get: () => null, put: () => {} }) };
+    window.ContentService = { createTextOutput: t => ({ t, setMimeType() { return this; }, downloadAsFile() { return this; } }), MimeType: { CSV: 'csv', JSON: 'json' } };
+    window.LockService = {}; window.ScriptApp = { getService: () => ({ getUrl: () => 'https://x/exec' }) }; window.HtmlService = {}; window.Logger = { log() {} };
+    const api = g(env);
+    Object.keys(api.TABS).forEach(n => sheets[n] = mkSheet(n, [api.TABS[n].slice()]));
+    sheets.Config.data.push(['currentSeason', 'S1'], ['profanityList', 'xx']);
+    const rec = (i, diff, failed) => ({ sessionId: 's' + i, playerId: 'p' + (i % 3), nickname: 'Nick' + i, age: 30, ageBand: '30-39', gender: i % 2 ? 'F' : 'M', hand: 'R', musicExp: 'none', mode: 'song', songId: 'ling-yu-ji-dong', difficulty: diff,
+      score: 100000 + i, grade: 'A', stars: 4, accuracy: 80 + i, maxCombo: 50, fullCombo: false, counts: { PERFECT: 10, GREAT: 5, GOOD: 2, MISS: 1, WRONG: 0, STRAY: 0 },
+      perPad: { kick: { notes: 20, hits: 18, acc: .9, meanErrMs: -12, sdErrMs: 30 }, snare: { notes: 20, hits: 15, acc: .75, meanErrMs: 8, sdErrMs: 40 } }, confusion: { kick: { kick: 18, snare: 1, hihat: 0, tom: 0, cymbal: 0, none: 1 } },
+      timing: { meanAsyncMs: -5, sdAsyncMs: 35, R: .8 }, coordination: {}, rhythmIndex: 70, coordinationIndex: 60, maxScore: 409200, failed, heartbeatCount: 2, notesTotal: 356, completionPct: failed ? 40 : 100,
+      sections: [{ i: 1, name: 'Pickup', n: 2, acc: 50 }, { i: 2, name: 'Verse 1', n: 30, acc: 85 }, { i: 7, name: 'Bridge', n: 20, acc: 60 }], timeline: [null, 70, 80, 85, 90, 88, 60, 80, 85, 90],
+      device: { type: 'phone', os: 'iOS', browser: 'Safari', input: 'touch', screen: '390x844', orientation: 'portrait', lang: 'en', tzOffsetMin: 480, localHour: 14, weekday: 2 }, settings: { pad4: false, noteSpeed: 1.8, calibrated: true, deviceLatencyMs: 20 }, player: { runNumber: i + 1, xp: 1000 }, deviceOffsetMs: 0, appVersion: '1.0.0-s2' });
+    for (let i = 0; i < 6; i++) { const r = rec(i, ['gentle', 'groove', 'fire'][i % 3], i === 4); api.appendSession_(r);
+      sheets.Leaderboard.data.push(api.TABS.Leaderboard.map(h => ({ ts: now, sessionId: r.sessionId, playerId: r.playerId, nickname: r.nickname, avatarColor: '#fff', ageBand: r.ageBand, gender: r.gender, showGender: false, songId: r.songId, difficulty: r.difficulty, season: 'S1', score: r.score, accuracy: r.accuracy, maxCombo: 50, srtMedian: 0, crtMedian: 0, rhythmIndex: 70, hidden: false })[h])); }
+    // Sessions rows: replace ts strings by Date (appendRow got Date already)
+    log('Sessions rows: ' + (sheets.Sessions.data.length - 1) + ', SectionStats rows: ' + (sheets.SectionStats.data.length - 1) + ', PadStats rows: ' + (sheets.PadStats.data.length - 1));
+    const a = api.dashAgg_({}); log('dashAgg_: kpi ' + JSON.stringify(a.kpi)); log(' sections ' + JSON.stringify(a.sections)); log(' timeline ' + JSON.stringify(a.timeline)); log(' learning[0..2] ' + JSON.stringify(a.learning.slice(0, 3)));
+    log(' padTiming ' + JSON.stringify(a.padTiming)); log(' completion ' + JSON.stringify(a.completion)); log(' devices ' + JSON.stringify(a.devices) + ' inputs ' + JSON.stringify(a.inputs));
+    const csv = api.exportCsv_({}).t; const lines = csv.split('\r\n'); log('export CSV: ' + lines.length + ' lines; header cols ' + lines[0].split(',').length + '; row1 cols ' + lines[1].split(',').length);
+    log(' header: ' + lines[0].slice(0, 400)); log(' privacy: nickname in CSV? ' + /Nick\d/.test(csv) + ', raw playerId in CSV? ' + /,p\d,/.test(csv));
+    log('ALL OK'); document.title = 'DONE';
+  } catch (e) { log('ERROR ' + (e.stack || e)); document.title = 'DONE'; } })();
+</script></body></html>

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>intelliCARE · beatmap builder</title>
+<style>body{font:13px/1.4 ui-monospace,Consolas,monospace;background:#0a0a14;color:#e8e8f4;margin:0;padding:16px}pre{white-space:pre;overflow:auto}</style></head>
+<body><h3>Beatmap builder: tempo grid + 4/4 cleanup → full / fire / groove / gentle (video time)</h3><pre id="log"></pre>
+<script>
+'use strict';
+/* Usage (headless, via tools/run_build.ps1):
+   build_chart.html?notes=<_check/beatmap.json>&grid=<_check/chart.json>&song=<JSON of song meta>&sections=<JSON [[bar,name],…]>
+   Inputs: NMF note list (analyze.html) + tempo grid / bar / alignment analysis (chart.html).
+   All note times are written in VIDEO time (stem time + alignment lag), so offsetMs = 0. */
+const L = []; const log = s => { L.push(s); document.getElementById('log').textContent = L.join('\n'); };
+const r3 = x => Math.round(x * 1000) / 1000, med = a => { if (!a.length) return NaN; const s = a.slice().sort((p, q) => p - q); return s[s.length >> 1]; };
+(async () => {
+  try {
+    const q = new URLSearchParams(location.search), getJ = async u => JSON.parse(new TextDecoder().decode(await (await fetch(u)).arrayBuffer()));
+    const bm = await getJ(q.get('notes')), G = await getJ(q.get('grid')), song = JSON.parse(q.get('song') || '{}'), secDef = JSON.parse(q.get('sections') || '[]');
+    const P = G.P, bar0 = G.bar0, nBars = G.nBars, shift = (bm.meta && bm.meta.alignOffsetS) || 0;
+    const raw = bm.charts.full.map(n => ({ t: n.t - shift, l: n.l, v: n.v })).sort((a, b) => a.t - b.t);   // stem time
+    // ---- 1. alignment lag: median of the confident piecewise windows ----
+    const good = (G.align || []).filter(a => a.corr >= .5 && a.ratio >= 1.05).map(a => a.lagS), lag = good.length ? med(good) : 0;
+    const lagSpread = good.length ? Math.max(...good) - Math.min(...good) : 0;
+    log('alignment: video_t = stem_t + ' + lag.toFixed(3) + ' s  (' + good.length + ' confident windows, spread ' + (lagSpread * 1000).toFixed(1) + ' ms)');
+    // ---- 2. drum region (first bar with kick+snare groove … last bar with hits) ----
+    const barOf = t => Math.floor((t - bar0) / (4 * P) + 1e-9);
+    const ksBars = new Map(); for (const n of raw) if (n.l === 'kick' || n.l === 'snare') { const b = barOf(n.t); ksBars.set(b, (ksBars.get(b) || 0) + 1); }
+    let firstBar = 0; for (let b = 0; b < nBars; b++) if ((ksBars.get(b) || 0) >= 2) { firstBar = b; break; }
+    let lastBar = nBars - 1; for (let b = nBars - 1; b >= 0; b--) if ((ksBars.get(b) || 0) >= 1) { lastBar = b; break; }
+    log('drums from bar ' + (firstBar + 1) + ' to bar ' + (lastBar + 1) + ' (1-based)');
+    // ---- 3. locally-adjusted beat grid (median kick/snare deviation over ±8 beats, then smoothed) ----
+    const nB = 4 * nBars + 1, gridT = k => bar0 + k * P;
+    const KS = raw.filter(n => n.l === 'kick' || n.l === 'snare');
+    const devAt = []; for (let k = 0; k < nB; k++) { const d = []; for (const n of KS) { const kk = Math.round((n.t - bar0) / P); if (Math.abs(kk - k) > 8) continue; const e = n.t - gridT(kk); if (Math.abs(e) < .06) d.push(e); } devAt.push(d.length >= 6 ? med(d) : NaN); }
+    // fill gaps by nearest valid value, then 5-beat moving average
+    let lastV = 0; for (let k = 0; k < nB; k++) { if (Number.isFinite(devAt[k])) lastV = devAt[k]; else devAt[k] = NaN; }
+    const filled = devAt.map((v, k) => { if (Number.isFinite(v)) return v; for (let r = 1; r < nB; r++) { if (Number.isFinite(devAt[k - r])) return devAt[k - r]; if (Number.isFinite(devAt[k + r])) return devAt[k + r]; } return 0; });
+    const adj = filled.map((v, k) => { let s = 0, c = 0; for (let j = k - 2; j <= k + 2; j++) if (j >= 0 && j < nB) { s += filled[j]; c++; } return s / c; });
+    const B = adj.map((v, k) => gridT(k) + v);   // stem-time beat k
+    log('grid correction range: ' + (Math.min(...adj) * 1000).toFixed(1) + ' … ' + (Math.max(...adj) * 1000).toFixed(1) + ' ms');
+    const slotT = (k, s) => B[k] + s / 4 * ((B[k + 1] || B[k] + P) - B[k]);   // s = 0..3 sixteenth within beat k
+    // ---- 4. snap every note to its 16th slot; drop off-grid noise ----
+    const slots = new Map();   // key lane|k|s → note
+    let offGrid = 0;
+    for (const n of raw) { const k = Math.floor((n.t - bar0) / P + 1 / 8); if (k < 0 || k >= nB - 1) continue; let best = null;
+      for (let kk = k - 1; kk <= k + 1; kk++) for (let s = 0; s < 4; s++) { if (kk < 0 || kk >= nB - 1) continue; const e = n.t - slotT(kk, s); if (!best || Math.abs(e) < Math.abs(best.e)) best = { k: kk, s, e }; }
+      if (!best || Math.abs(best.e) > .045) { offGrid++; continue; }
+      const bar = Math.floor(best.k / 4); if (bar < firstBar || bar > lastBar) continue;
+      const key = n.l + '|' + best.k + '|' + best.s, o = slots.get(key), t = Math.abs(best.e) <= .03 ? n.t : slotT(best.k, best.s);
+      if (!o || n.v > o.v) slots.set(key, { t, l: n.l, v: n.v, k: best.k, s: best.s, bar, beat: best.k % 4, step: (best.k % 4) * 4 + best.s }); }
+    let notes = Array.from(slots.values());
+    const has = (l, k, s) => slots.has(l + '|' + k + '|' + s);
+    log('snapped ' + notes.length + ' notes, dropped ' + offGrid + ' off-grid');
+    // ---- 5. crosstalk clean-up on the grid ----
+    let tomX = 0, tomK = 0, cymX = 0, hatX = 0;
+    notes = notes.filter(n => {
+      if (n.l === 'tom') { if (has('kick', n.k, n.s) || has('snare', n.k, n.s)) { tomX++; return false; }   // tom on a kick/snare slot = leak
+        // the stem's tom activation shadows the kick on every bar (template crosstalk) → a lone "tom" is a kick the kick lane missed
+        n.l = 'kick'; slots.set('kick|' + n.k + '|' + n.s, n); tomK++; return true; }
+      if (n.l === 'cymbal') { const nearDown = n.step <= 1;   // crash on (or one 16th after) the downbeat → keep, snap to the downbeat
+        if (nearDown) { n.s = 0; n.step = 0; n.k = n.bar * 4; n.t = B[n.k]; return true; } cymX++; return false; }
+      if (n.l === 'hihat') { if (n.s % 2) { hatX++; return false; } return true; }   // keep 8th-note hats only
+      return true; });
+    // one crash per downbeat; a crash replaces the hi-hat on that slot
+    const seen = new Set(); notes = notes.filter(n => { if (n.l !== 'cymbal') return true; if (seen.has(n.k)) return false; seen.add(n.k); return true; });
+    notes = notes.filter(n => !(n.l === 'hihat' && seen.has(n.k) && n.s === 0));
+    // final hit: crash with the last kick
+    const lastKick = notes.filter(n => n.l === 'kick').sort((a, b) => b.t - a.t)[0];
+    if (lastKick && !notes.some(n => n.l === 'cymbal' && n.k === lastKick.k && n.s === lastKick.s)) notes.push({ ...lastKick, l: 'cymbal', v: 1 });
+    notes.sort((a, b) => a.t - b.t || a.l.localeCompare(b.l));
+    log('removed: ' + tomX + ' tom leaks, ' + cymX + ' cymbal leaks (not on a downbeat), ' + hatX + ' 16th hi-hats; relabelled ' + tomK + ' lone toms as kicks');
+    // ---- 6. difficulty charts ----
+    const out = (arr) => arr.map(n => ({ t: r3(n.t + lag), l: n.l, v: Math.round(n.v * 100) / 100, bud: false }));
+    const fire = notes.slice();
+    const groove = notes.filter(n => (n.l === 'kick' && n.s % 2 === 0) || (n.l === 'snare' && n.s % 2 === 0 && (n.s === 0 || n.v >= .6)) || (n.l === 'hihat' && n.s === 0) || n.l === 'cymbal' || n.l === 'tom');
+    // gentle: one note per beat, quarter-note slots only; prefer kick on beats 1 & 3, snare on 2 & 4
+    const byBeat = new Map(); for (const n of notes) { if ((n.l !== 'kick' && n.l !== 'snare') || n.s !== 0) continue; const want = (n.beat % 2 === 0) ? 'kick' : 'snare', sc = (n.l === want ? 2 : 1) + n.v;
+      const c = byBeat.get(n.k); if (!c || sc > c.sc) byBeat.set(n.k, { n, sc }); }
+    // a beat with no quarter-note kick/snare (e.g. the half-time bridge) may take its "and" (8th) kick instead
+    for (const n of notes) { if (n.l !== 'kick' || n.s !== 2 || byBeat.has(n.k)) continue; byBeat.set(n.k, { n, sc: 0 }); }
+    let gentle = Array.from(byBeat.values()).map(x => x.n).sort((a, b) => a.t - b.t);
+    // Gentle rule (≥ 300 ms between notes on the same pad): drop an "and" kick that crowds a neighbouring kick
+    gentle = gentle.filter((n, i) => { if (n.s === 0) return true; const near = gentle.some((m, j) => j !== i && m.l === n.l && Math.abs(m.t - n.t) < .3); return !near; });
+    // ---- 7. sections, beats, downbeats (video time) ----
+    const beats = [], downbeats = []; for (let k = firstBar * 4; k <= Math.min(nB - 1, (lastBar + 2) * 4); k++) { const t = r3(B[k] + lag); if (t < 0) continue; beats.push(t); if (k % 4 === 0) downbeats.push(t); }
+    const sections = [{ t: 0, name: 'Intro' }].concat(secDef.filter(s => s[0] - 1 >= firstBar).map(s => ({ t: r3(B[(s[0] - 1) * 4] + lag), name: s[1] })));
+    // ---- 8. QA ----
+    const cnt = a => a.reduce((m, n) => (m[n.l] = (m[n.l] || 0) + 1, m), { kick: 0, snare: 0, hihat: 0, tom: 0, cymbal: 0 });
+    const maxRate = a => { let mx = 0; for (const l of ['kick', 'snare', 'hihat', 'tom', 'cymbal']) { const ts = a.filter(n => n.l === l).map(n => n.t); let j = 0; for (let i = 0; i < ts.length; i++) { while (ts[i] - ts[j] > 1) j++; mx = Math.max(mx, i - j + 1); } } return mx; };
+    const durS = song.duration || 0, playS = (notes.length ? notes[notes.length - 1].t - notes[0].t : 0);
+    const C = cnt(fire), N = fire.length, ksShare = (C.kick + C.snare) / (N || 1);
+    const ms = n => n >= 30 ? 1200 * n - 18000 : 300 * n;
+    // per-bar fidelity to the 4/4 backbone (kick on 1, snare on 2 & 4) in the groove sections
+    let bb = 0, bbOk = 0; for (let b = firstBar + 1; b < lastBar; b++) { const k = b * 4; if (!has('kick', k, 0) && !has('snare', k + 1, 0)) continue; bb++; if (has('kick', k, 0) && (has('snare', k + 1, 0) || has('snare', k + 3, 0))) bbOk++; }
+    const qa = { durationS: durS, bpm: Math.round(G.bpm * 100) / 100, timeSignature: '4/4', notes: C, notesPerMin: Math.round(N / (playS / 60) * 10) / 10, maxLaneRatePerS: maxRate(fire), kickSnareShare: Math.round(ksShare * 1000) / 1000,
+      backboneBars: { checked: bb, kickOn1AndSnareOn2or4: bbOk },
+      alignment: { lagMs: Math.round(lag * 1000), corrPeak: r3(med((G.align || []).filter(a => a.corr >= .5).map(a => a.corr))), windows: good.length, spreadMs: Math.round(lagSpread * 1000), method: 'onset-xcorr, piecewise 20 s windows' },
+      gates: { maxLaneRatePerS: '≤ 12', kickSnareShare: '> 0.35' },
+      postprocess: 'notes snapped to a locally-corrected 16th grid (±45 ms); tom on a kick/snare slot removed, lone tom relabelled kick (tom template shadows the kick); cymbal kept only on a downbeat (crash); 16th hi-hats removed; intro/outro outside the drum region removed',
+      difficulties: { gentle: { notes: gentle.length, maxScore: ms(gentle.length) }, groove: { notes: groove.length, maxScore: ms(groove.length) }, fire: { notes: fire.length, maxScore: ms(fire.length) } } };
+    const pass = qa.maxLaneRatePerS <= 12 && ksShare > .35;
+    log('\nQA ' + (pass ? 'PASS' : 'FAIL') + ': ' + JSON.stringify(qa, null, 1));
+    const beatmap = { version: 1, song: Object.assign({ duration: durS, previewStart: r3(B[(secDef.find(s => /chorus/i.test(s[1])) || [firstBar + 1])[0] * 4 - 4] + lag) }, song),
+      offsetMs: 0, bpm: qa.bpm, timeSignature: [4, 4], beats, downbeats, sections, lanes: ['kick', 'snare', 'hihat', 'tom', 'cymbal'],
+      charts: { full: out(fire), fire: out(fire), groove: out(groove), gentle: out(gentle) },
+      meta: { generator: 'tools/analyze.html (template NMF on the isolated drum stem) → tools/chart.html (tempo grid, 4/4 downbeat, piecewise alignment) → tools/build_chart.html (grid snap + cleanup + difficulties)',
+        created: new Date().toISOString().slice(0, 10), alignment: qa.alignment, qa, timesAre: 'video time (stem time + alignment lag); offsetMs is a user nudge only' } };
+    // ---- 9. human-readable check of the result (first 4 bars of every section) ----
+    log('\n== cleaned chart: first 2 bars of each section (K S H T C, 16 steps) ==');
+    const ch = { kick: 'K', snare: 'S', hihat: 'H', tom: 'T', cymbal: 'C' };
+    for (const s of [[firstBar + 1, 'start']].concat(secDef)) { for (let b = s[0] - 1; b < s[0] + 1 && b <= lastBar; b++) { const row = {}; for (const l in ch) row[l] = Array(16).fill('.'); for (const n of fire) if (n.bar === b) row[n.l][n.step] = ch[n.l];
+        const g = Array(16).fill('.'); for (const n of gentle) if (n.bar === b) g[n.step] = ch[n.l];
+        const f = a => a.slice(0, 4).join('') + '|' + a.slice(4, 8).join('') + '|' + a.slice(8, 12).join('') + '|' + a.slice(12).join('');
+        log(String(b + 1).padStart(3) + ' ' + (b === s[0] - 1 ? s[1] : '').padEnd(14) + ' K ' + f(row.kick) + ' S ' + f(row.snare) + ' H ' + f(row.hihat) + ' T ' + f(row.tom) + ' C ' + f(row.cymbal) + '   gentle ' + f(g)); } }
+    window.BEATMAP = beatmap; document.title = 'DONE';
+  } catch (e) { log('ERROR ' + (e.stack || e)); document.title = 'ERROR'; }
+})();
+</script></body></html>
