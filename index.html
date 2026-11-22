@@ -1526,19 +1526,32 @@ const Leaderboard = {
   entry(p, extra) { return Object.assign({ sessionId: uuid(), playerId: p.playerId, nickname: p.nickname, avatarColor: p.avatarColor, ageBand: p.ageBand, gender: p.gender, showGender: !!p.showGender, songId: Config.SONG_ID, difficulty: '', score: 0, accuracy: 0, maxCombo: 0, srtMedian: 0, crtMedian: 0, rhythmIndex: 0 }, extra); },
   outbox() { return Storage.get(SK('outbox'), []); },
   enqueue(payload) { const o = this.outbox(); if (o.some(x => x.payload.entry.sessionId === payload.entry.sessionId)) return; o.push({ payload, tries: 0, nextAt: Date.now() + 5000, endpoint: ENDPOINT(), songId: Config.SONG_ID }); Storage.set(SK('outbox'), o.slice(-50)); },
-  async flush() {
-    if (!ENDPOINT() || this.flushing) return; this.flushing = true;
+  /** force = ignore the back-off timer (app start, "Sync now"). Never sends an item to an endpoint other than its own. */
+  async flush(force) {
+    if (!ENDPOINT() || this.flushing) return; this.flushing = true; let sent = 0;
     try { let o = this.outbox(); const keep = [];
-      for (const it of o) { if (it.nextAt > Date.now() || it.endpoint !== ENDPOINT() || (it.songId && it.songId !== Config.SONG_ID)) { keep.push(it); continue; }   // never send one backend's queued scores to another
-        try { this.inflight++; await LeaderboardClient.post(it.payload, it.endpoint); this.lastOk = Date.now(); } catch (e) { if (!e.server) { it.tries++; it.nextAt = Date.now() + Math.min(300000, 5000 * Math.pow(2, it.tries)); keep.push(it); } } finally { this.inflight--; } }
-      Storage.set(SK('outbox'), keep); } finally { this.flushing = false; }
+      for (const it of o) { if ((!force && it.nextAt > Date.now()) || it.endpoint !== ENDPOINT() || (it.songId && it.songId !== Config.SONG_ID)) { keep.push(it); continue; }   // never send one backend's queued scores to another
+        try { this.inflight++; await LeaderboardClient.post(it.payload, it.endpoint); this.lastOk = Date.now(); sent++; } catch (e) {
+          // rate-limited (1 submit / 20 s per player): keep it and retry in 21 s instead of dropping it
+          if (e.server && /rate limit/i.test(e.message)) { it.nextAt = Date.now() + 21000; keep.push(it); continue; }
+          if (!e.server) { it.tries++; it.nextAt = Date.now() + Math.min(300000, 5000 * Math.pow(2, it.tries)); keep.push(it); } } finally { this.inflight--; } }
+      // merge with anything queued while we were sending
+      const now = this.outbox().filter(x => !o.some(y => y.payload.entry.sessionId === x.payload.entry.sessionId)); Storage.set(SK('outbox'), keep.concat(now).slice(-50)); }
+    finally { this.flushing = false; this.updQueue(); }
+    if (sent) { UI.toast('☁ ' + sent + ' ' + T('queued score(s) synced', '条离线成绩已同步')); if (this.shown) this.load(false); }
   },
+  /** own (this-song, this-endpoint) items still waiting */
+  pending() { const e = ENDPOINT(); return this.outbox().filter(it => it.endpoint === e && (!it.songId || it.songId === Config.SONG_ID)).length; },
+  updQueue() { const el = $('#lbQueue'); if (!el) return; const n = this.pending(); el.innerHTML = n ? '⏳ ' + n + ' ' + T('queued', '条待同步') + ' · <button class="btn small" onclick="Leaderboard.flush(true)">' + T('Sync now', '立即同步') + '</button>' : ''; },
+  /** background retry while anything is queued (every 30 s, visible tab only) */
+  startAutoSync() { if (this._auto) return; this._auto = setInterval(() => { if (!document.hidden && this.pending()) this.flush(); }, 30000); },
   async send(payload, chip) {
     const say = h => { if (chip) chip.innerHTML = h; };
     try { this.inflight++; const j = await LeaderboardClient.post(payload); this.lastOk = Date.now(); const r = j.ranks || {}, g = r.score || r.accuracy;
       if (g) say('🌍 #' + g.global + ' ' + T('of', '/') + ' ' + g.n + ' ' + T('worldwide', '全球') + (g.bandN ? ' · #' + g.bandRank + ' ' + T('of', '/') + ' ' + g.bandN + ' ' + T('in age', '年龄段') + ' ' + g.band : '') + ' · ' + g.pct + ' %ile');
       else say(T('Submitted ✔', '已提交 ✔')); this.flush(); return j;
-    } catch (e) { if (e.server) say(T('Not accepted by server: ', '服务器未接受：') + esc(e.message)); else { this.enqueue(payload); say(T('Saved offline — will sync', '已离线保存 — 将自动同步')); } }
+    } catch (e) { if (e.server && /rate limit/i.test(e.message)) { this.enqueue(payload); say(T('Queued — will send in a few seconds', '已排队 — 几秒后自动提交')); }
+      else if (e.server) say(T('Not accepted by server: ', '服务器未接受：') + esc(e.message)); else { this.enqueue(payload); say(T('Saved offline — will sync', '已离线保存 — 将自动同步')); } }
     finally { this.inflight--; }
   },
   submitRun(R, p) {
@@ -1563,7 +1576,7 @@ const Leaderboard = {
       if (j.version === this.ver && !first) { this.stamp(j); return; } this.ver = j.version; this.draw(j); this.stamp(j);
     } catch (e) { this.inflight = Math.max(0, this.inflight - 1); this.updPill(); if (first) this.draw({ error: true }); }
   },
-  updPill() { const el = $('#lbPill'); if (el) el.innerHTML = this.pill(); },
+  updPill() { const el = $('#lbPill'); if (el) el.innerHTML = this.pill(); this.updQueue(); },
   stamp(j) { const el = $('#lbTime'); if (el) el.textContent = T('updated ', '更新于 ') + new Date().toLocaleTimeString(); this.updPill(); },
   chips(key, opts) { return '<div class="chips">' + opts.map(o => '<button class="' + (this.L[key] === o[0] ? 'on' : '') + '" onclick="Leaderboard.set(\'' + key + '\',' + (typeof o[0] === 'string' ? '\'' + o[0] + '\'' : o[0]) + ')">' + o[1] + '</button>').join('') + '</div>'; },
   draw(j) {
@@ -1574,7 +1587,7 @@ const Leaderboard = {
     else { const cur = new Set(); rows = j.rows.length ? j.rows.map(r => { cur.add(r.sid); const isNew = this.prev.size && !this.prev.has(r.sid) || r.isNew, me = j.me && j.me.rank === r.rank;
       return '<div class="lbrow ' + (me ? 'me ' : '') + (isNew ? 'new' : '') + '"><span class="rk">' + r.rank + '</span><span class="av" style="background:' + esc(r.avatarColor) + '"></span><span class="nm">' + esc(r.nickname) + ' <span class="sm dim">' + esc(r.ageBand || '') + (r.gender ? ' · ' + esc(r.gender) : '') + '</span></span>' + (isNew ? '<span class="stat sync">NEW</span>' : '') + '<b class="num">' + this.fmtv(r.value) + '</b><span class="sm dim">' + esc(r.date) + '</span></div>'; }).join('') : '<div class="dim sm">' + T('No scores yet — be the first!', '暂无成绩 — 快来抢第一！') + '</div>';
       if (j.me && j.me.rank > 10) rows += '<div class="lbrow me"><span class="rk">' + j.me.rank + '</span><span class="nm">' + T('You', '你') + '</span><b class="num">' + this.fmtv(j.me.value) + '</b></div>'; this.prev = cur; rows += '<div class="sm dim">n = ' + j.n + '</div>'; }
-    UI.sheet('<div class="row sb"><h2 style="margin:0">🏆 ' + T('Leaderboard', '排行榜') + '</h2><span><span id="lbPill">' + this.pill() + '</span></span></div><div class="sm dim" id="lbTime"></div>' +
+    UI.sheet('<div class="row sb"><h2 style="margin:0">🏆 ' + T('Leaderboard', '排行榜') + '</h2><span><span id="lbPill">' + this.pill() + '</span></span></div><div class="sm dim" id="lbTime"></div><div class="sm" id="lbQueue" style="margin:4px 0"></div>' +
       '<h3>' + T('Board', '榜单') + '</h3>' + this.chips('board', [['score', T('Score', '分数')], ['accuracy', T('Accuracy', '准确率')], ['combo', T('Combo', '连击')], ['srt', T('Reflex SRT', '简单反应')], ['crt', T('Reflex CRT', '选择反应')], ['rhythm', T('Rhythm', '节奏')]]) +
       (['score', 'accuracy', 'combo'].indexOf(L.board) >= 0 ? this.chips('diff', [['gentle', T('Gentle', '轻柔')], ['groove', T('Groove', '律动')], ['fire', T('Fire', '烈焰')]]) : '') +
       this.chips('period', [['all', T('All-time', '总榜')], ['season', T('Season', '赛季')], ['week', T('This week', '本周')], ['today', T('Today', '今天')]]) +
@@ -1979,7 +1992,7 @@ const App = {
     document.addEventListener('visibilitychange', () => { if (document.hidden) { if (Game.state === 'PLAYING') Game.pause(); } else Leaderboard.flush(); });
     addEventListener('online', () => Leaderboard.flush());
     document.addEventListener('contextmenu', e => e.preventDefault());
-    applyI18n(); UI.showMenu(); Leaderboard.flush(); Norms.refresh();
+    applyI18n(); UI.showMenu(); Leaderboard.flush(true); Leaderboard.startAutoSync(); Norms.refresh();
     if (qs.get('test') === '1') Tests.run();
     if (qs.has('editor')) Editor.open();
   }
