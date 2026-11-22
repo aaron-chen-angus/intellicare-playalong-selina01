@@ -1,0 +1,14 @@
+# local upload bundle (built by tools/make_upload.ps1)
+selina01_github.zip
+_github_upload/
+# analysis / check outputs
+tools/_check/
+tools/_probe*
+tools/_shots*.log
+tools/_stage.txt
+*.tmp
+# large source media (kept on OneDrive, not needed by the web app)
+assets/src/
+assets/*.png
+assets/*.jpg
+sounds/*drums.*
